@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
+import torch.nn.functional as F
 
 
 ###############################################################################
@@ -155,6 +156,8 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_256':
         net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
+    elif netG == 'resnet9_eff_attn':
+        net = EAGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9)
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % netG)
     return init_net(net, init_type, init_gain, gpu_ids)
@@ -464,6 +467,174 @@ class UnetGenerator(nn.Module):
     def forward(self, input):
         """Standard forward"""
         return self.model(input)
+    
+class EAGenerator(nn.Module):
+
+    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect'):
+        """Construct a Resnet-based generator
+        
+        Parameters:
+            input_nc (int)      -- the number of channels in input images
+            output_nc (int)     -- the number of channels in output images
+            ngf (int)           -- the number of filters in the last conv layer
+            norm_layer          -- normalization layer
+            use_dropout (bool)  -- if use dropout layers
+            n_blocks (int)      -- the number of ResNet blocks
+            padding_type (str)  -- the name of padding layer in conv layers: reflect | replicate | zero
+        """
+        print("efficient attention generator")
+        assert(n_blocks >= 0)
+        super(EAGenerator, self).__init__()
+        
+        if type(norm_layer) == functools.partial:
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        self.initial = nn.Sequential(nn.ReflectionPad2d(3),
+                 nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
+                 norm_layer(ngf),
+                 nn.ReLU(True),
+                 EfficientAttention(ngf),
+                 )
+
+        self.downsampling1 = nn.Sequential(
+            nn.Conv2d(ngf, ngf * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
+            norm_layer(ngf * 2),
+            nn.ReLU(True),
+            EfficientAttention(ngf * 2),
+            )
+
+        self.downsampling2 = nn.Sequential(
+            nn.Conv2d(ngf * 2, ngf * 4, kernel_size=3, stride=2, padding=1, bias=use_bias),
+            norm_layer(ngf * 4),
+            nn.ReLU(True),
+            EfficientAttention(ngf * 4),
+            )
+        
+        self.residual_blocks = nn.Sequential(
+            *[ResnetBlock(ngf * 4, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias) for _ in range(n_blocks)]
+        )
+
+        self.ea_up1 = EfficientAttention(ngf * 4, prev_attn=True, return_keys=False)
+        self.upsampling1 = nn.Sequential(
+            nn.ConvTranspose2d(ngf * 4, int(ngf * 2),
+                                         kernel_size=3, stride=2,
+                                         padding=1, output_padding=1,
+                                         bias=use_bias),
+                      norm_layer(int(ngf * 2)),
+                      nn.ReLU(True)
+        )
+
+        self.ea_up2 = EfficientAttention(ngf * 2, prev_attn= True, return_keys=False)
+        self.upsampling2 = nn.Sequential(
+            nn.ConvTranspose2d(ngf * 2, int(ngf),
+                                         kernel_size=3, stride=2,
+                                         padding=1, output_padding=1,
+                                         bias=use_bias),
+                      norm_layer(int(ngf)),
+                      nn.ReLU(True)
+        )
+
+        self.ea_up3 = EfficientAttention(ngf, prev_attn= True, return_keys=False)
+        self.final = nn.Sequential(
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0),
+            nn.Tanh(),
+        )
+    
+    # @profile_every(1)
+    def forward(self, input):
+        """Standard forward"""
+        x, keys0= self.initial(input)
+        x, keys1 = self.downsampling1(x)
+        x, keys2 = self.downsampling2(x)
+        x = self.residual_blocks(x)
+        x = self.ea_up1(x,keys2)
+        x = self.upsampling1(x)
+        x = self.ea_up2(x,keys1)
+        x = self.upsampling2(x)
+        x = self.ea_up3(x,keys0)
+        x = self.final(x)
+        return x
+
+        # return keys for visualization purposes
+        # return x, keys0
+
+class EfficientAttention(nn.Module):
+    
+    def __init__(self, in_channels, head_count=1, prev_attn = False, return_keys = True, initialize_ones=False):
+        super().__init__()
+        self.return_keys = return_keys
+        
+        
+        self.in_channels = in_channels      
+        self.key_channels = max(8, in_channels // 2)
+        self.head_count = head_count
+        self.value_channels = max(8, in_channels // 2)
+        
+        self.prev_attn = prev_attn
+        if self.prev_attn == False:
+            self.keys = nn.Conv2d(in_channels, self.key_channels, 1)
+        else:
+            self.refine_attnt = nn.Conv2d(self.key_channels, self.key_channels, 3, 1, 1, padding_mode="reflect", groups=self.key_channels)
+        
+        self.queries = nn.Conv2d(in_channels, self.key_channels, 1)
+        self.values = nn.Conv2d(in_channels, self.value_channels, 1)
+        self.reprojection = nn.Conv2d(self.value_channels, in_channels, 1)
+
+        self.gamma = nn.Parameter(torch.ones(1) if initialize_ones else torch.zeros(1)) 
+
+    def forward(self, input_, prev_keys=None):
+        n, _, h, w = input_.size()
+        if self.prev_attn == False:
+            keys = self.keys(input_).reshape((n, self.key_channels, h * w))
+        elif self.prev_attn and prev_keys is not None:
+            keys = prev_keys.reshape((n, self.key_channels, h , w)) + self.refine_attnt(prev_keys.reshape((n, self.key_channels, h , w)))
+            keys = keys.reshape((n, self.key_channels, h * w))
+
+        queries = self.queries(input_).reshape(n, self.key_channels, h * w)
+        values = self.values(input_).reshape((n, self.value_channels, h * w))
+        head_key_channels = self.key_channels // self.head_count
+        head_value_channels = self.value_channels // self.head_count
+        
+                   
+
+        attended_values = []
+        for i in range(self.head_count):
+        
+            key = F.softmax(keys[
+                :,
+                i * head_key_channels: (i + 1) * head_key_channels,
+                :
+            ], dim=2)
+
+            query = F.softmax(queries[
+                :,
+                i * head_key_channels: (i + 1) * head_key_channels,
+                :
+            ], dim=1)
+
+            value = values[
+                :,
+                i * head_value_channels: (i + 1) * head_value_channels,
+                :
+            ]
+
+            context = key @ value.transpose(1, 2)
+            attended_value = (
+                context.transpose(1, 2) @ query
+            ).reshape(n, head_value_channels, h, w)
+            attended_values.append(attended_value)
+
+        aggregated_values = torch.cat(attended_values, dim=1)
+        reprojected_value = self.reprojection(aggregated_values)
+        attention = self.gamma*reprojected_value + input_
+
+        if self.return_keys == True:
+            return attention, keys 
+        else: 
+            return attention
 
 
 class UnetSkipConnectionBlock(nn.Module):
