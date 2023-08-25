@@ -24,6 +24,7 @@ comparison metric.
 An interesting aspect to observe from the trained
 EAGAN model are the computed attention
 maps for a given input. These maps can be observed by visualizing each channel in the Key vector from the efficient attention block. By doing so, it is possible to get an intuition of how each attention map attend to different areas of the image as observed in the following figure.
+
 <img src='assets/attention_maps.jpg' width="600px"/>
 
 ### Additional Details
