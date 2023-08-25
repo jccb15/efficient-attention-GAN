@@ -3,19 +3,19 @@
 This repository presents an implementations of a denominated Efficient Attention GAN for unpaired image-to-image translation.
 This architectures follows the CycleGAN framework to introduce Efficient Attention blocks in the generator network of the translation process. This architecture is illustrated in the following figure. 
 
-<img src='assets/eagan.png' width="600px"/>
+<img src='assets/eagan.jpg' width="600px"/>
 
 ## Results
 to evaluate and compare the performance between the proposed architecture against competing solutions, a series of models were trained from scratch on data sets for object and scenery translation. The KID score was used as the main
 comparison metric.
 
 ### Scenery Comparison
-<img src='assets/scenery_comparison.png' width="600px"/>
+<img src='assets/scenery_comparison.jpg' width="600px"/>
 <img src='assets/scenery_zoom.jpg' width="600px"/>
 <img src='assets/scenery_oi.jpg' width="600px"/>
 
 ### Object Comparison
-<img src='assets/object_comparison.png' width="400px"/>
+<img src='assets/object_comparison.jpg' width="400px"/>
 <img src='assets/object_zoom.jpg' width="600px"/>
 <img src='assets/object_oi.jpg' width="600px"/>
 
